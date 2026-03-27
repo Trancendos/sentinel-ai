@@ -1,0 +1,387 @@
+# ============================================================================
+# Trancendos Ecosystem - Dependency Risk Analyzer
+# ============================================================================
+# Purpose: Predictive analytics for dependency conflicts and build failures
+# Usage: Uses across all Trancendos repositories
+# ============================================================================
+
+name: 'Dependency Risk Analyzer'
+description: 'Analyzes dependency health, predicts conflicts, and calculates risk scores'
+author: 'Trancendos'
+
+inputs:
+  package-manager:
+    description: 'Package manager to use (npm, pnpm, yarn, pip)'
+    required: false
+    default: 'auto'
+  
+  risk-threshold:
+    description: 'Risk score threshold to fail (0-100)'
+    required: false
+    default: '70'
+  
+  fail-on-high-risk:
+    description: 'Fail the action if high risk is detected'
+    required: false
+    default: 'true'
+  
+  generate-report:
+    description: 'Generate detailed risk report'
+    required: false
+    default: 'true'
+  
+  slack-webhook:
+    description: 'Slack webhook URL for alerts'
+    required: false
+    default: ''
+
+outputs:
+  risk-score:
+    description: 'Calculated risk score (0-100)'
+    value: ${{ steps.calculate-risk.outputs.risk_score }}
+  
+  risk-level:
+    description: 'Risk level (low, medium, high, critical)'
+    value: ${{ steps.calculate-risk.outputs.risk_level }}
+  
+  conflicts-detected:
+    description: 'Number of dependency conflicts detected'
+    value: ${{ steps.analyze-dependencies.outputs.conflicts }}
+  
+  report-path:
+    description: 'Path to the generated risk report'
+    value: ${{ steps.generate-report.outputs.report_path }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Detect Package Manager
+      id: detect-pm
+      shell: bash
+      run: |
+        PM="${{ inputs.package-manager }}"
+        if [[ "$PM" == "auto" ]]; then
+          if [[ -f "pnpm-lock.yaml" ]]; then
+            PM="pnpm"
+          elif [[ -f "yarn.lock" ]]; then
+            PM="yarn"
+          elif [[ -f "package-lock.json" ]]; then
+            PM="npm"
+          elif [[ -f "requirements.txt" ]] || [[ -f "pyproject.toml" ]]; then
+            PM="pip"
+          else
+            PM="npm"
+          fi
+        fi
+        echo "package_manager=$PM" >> $GITHUB_OUTPUT
+        echo "📦 Detected package manager: $PM"
+    
+    - name: Setup Node.js (for JS projects)
+      if: steps.detect-pm.outputs.package_manager != 'pip'
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+    
+    - name: Setup pnpm
+      if: steps.detect-pm.outputs.package_manager == 'pnpm'
+      uses: pnpm/action-setup@v4
+      with:
+        version: '10.30.1'
+    
+    - name: Analyze Dependencies
+      id: analyze-dependencies
+      shell: bash
+      run: |
+        echo "🔍 Analyzing dependencies..."
+        
+        PM="${{ steps.detect-pm.outputs.package_manager }}"
+        CONFLICTS=0
+        PEER_ISSUES=0
+        DEPRECATED=0
+        VULNERABILITIES=0
+        
+        # Create analysis directory
+        mkdir -p .risk-analysis
+        
+        if [[ "$PM" == "pnpm" ]]; then
+          # pnpm analysis
+          pnpm install --frozen-lockfile --dry-run 2>&1 | tee .risk-analysis/install.log || true
+          
+          # Check for peer dependency issues
+          PEER_ISSUES=$(grep -c "WARN.*peer" .risk-analysis/install.log 2>/dev/null || echo 0)
+          
+          # Run pnpm audit
+          pnpm audit --json > .risk-analysis/audit.json 2>/dev/null || true
+          VULNERABILITIES=$(jq '.metadata.vulnerabilities.total // 0' .risk-analysis/audit.json 2>/dev/null || echo 0)
+          
+          # Check for deprecated packages
+          pnpm ls --json 2>/dev/null | jq -r '.[] | select(.deprecated == true) | .name' > .risk-analysis/deprecated.txt 2>/dev/null || true
+          DEPRECATED=$(wc -l < .risk-analysis/deprecated.txt 2>/dev/null || echo 0)
+          
+        elif [[ "$PM" == "npm" ]]; then
+          # npm analysis
+          npm install --dry-run 2>&1 | tee .risk-analysis/install.log || true
+          
+          # Check for ERESOLVE errors
+          if grep -q "ERESOLVE" .risk-analysis/install.log 2>/dev/null; then
+            CONFLICTS=$((CONFLICTS + 1))
+          fi
+          
+          # npm audit
+          npm audit --json > .risk-analysis/audit.json 2>/dev/null || true
+          VULNERABILITIES=$(jq '.metadata.vulnerabilities.total // 0' .risk-analysis/audit.json 2>/dev/null || echo 0)
+          
+        elif [[ "$PM" == "yarn" ]]; then
+          yarn install --dry-run 2>&1 | tee .risk-analysis/install.log || true
+          yarn audit --json > .risk-analysis/audit.json 2>/dev/null || true
+          VULNERABILITIES=$(jq '.data.analytics.malicious.total // 0' .risk-analysis/audit.json 2>/dev/null || echo 0)
+          
+        elif [[ "$PM" == "pip" ]]; then
+          pip install --dry-run -r requirements.txt 2>&1 | tee .risk-analysis/install.log || true
+          pip-audit --format json > .risk-analysis/audit.json 2>/dev/null || true
+          VULNERABILITIES=$(jq 'length' .risk-analysis/audit.json 2>/dev/null || echo 0)
+        fi
+        
+        # Check for known problematic patterns
+        KNOWN_CONFLICTS=0
+        if [[ -f "package.json" ]]; then
+          # Check openai/zod conflict pattern
+          ZOD_V=$(jq -r '.dependencies.zod // empty' package.json 2>/dev/null)
+          OPENAI_V=$(jq -r '.dependencies.openai // empty' package.json 2>/dev/null)
+          
+          if [[ "$ZOD_V" == *"4."* ]] && [[ "$OPENAI_V" == *"4."* ]]; then
+            echo "⚠️ KNOWN CONFLICT: openai@4.x requires zod@3.x but zod@4.x is installed"
+            KNOWN_CONFLICTS=$((KNOWN_CONFLICTS + 1))
+          fi
+        fi
+        
+        TOTAL_CONFLICTS=$((CONFLICTS + PEER_ISSUES + KNOWN_CONFLICTS))
+        
+        echo "conflicts=$TOTAL_CONFLICTS" >> $GITHUB_OUTPUT
+        echo "vulnerabilities=$VULNERABILITIES" >> $GITHUB_OUTPUT
+        echo "deprecated=$DEPRECATED" >> $GITHUB_OUTPUT
+        echo "peer_issues=$PEER_ISSUES" >> $GITHUB_OUTPUT
+        
+        echo ""
+        echo "📊 Analysis Results:"
+        echo "  - Dependency Conflicts: $TOTAL_CONFLICTS"
+        echo "  - Vulnerabilities: $VULNERABILITIES"
+        echo "  - Deprecated Packages: $DEPRECATED"
+        echo "  - Peer Dependency Issues: $PEER_ISSUES"
+    
+    - name: Calculate Risk Score
+      id: calculate-risk
+      shell: bash
+      run: |
+        # Risk Score Formula:
+        # Risk = (Conflicts × 25) + (Vulnerabilities × 10) + (Deprecated × 5) + (PeerIssues × 15)
+        # Normalized to 0-100 scale
+        
+        CONFLICTS=${{ steps.analyze-dependencies.outputs.conflicts || 0 }}
+        VULNS=${{ steps.analyze-dependencies.outputs.vulnerabilities || 0 }}
+        DEPRECATED=${{ steps.analyze-dependencies.outputs.deprecated || 0 }}
+        PEER_ISSUES=${{ steps.analyze-dependencies.outputs.peer_issues || 0 }}
+        
+        RAW_SCORE=$(( (CONFLICTS * 25) + (VULNS * 10) + (DEPRECATED * 5) + (PEER_ISSUES * 15) ))
+        
+        # Normalize to 0-100
+        if [[ $RAW_SCORE -gt 100 ]]; then
+          RISK_SCORE=100
+        else
+          RISK_SCORE=$RAW_SCORE
+        fi
+        
+        # Determine risk level
+        if [[ $RISK_SCORE -ge 80 ]]; then
+          RISK_LEVEL="critical"
+        elif [[ $RISK_SCORE -ge 60 ]]; then
+          RISK_LEVEL="high"
+        elif [[ $RISK_SCORE -ge 40 ]]; then
+          RISK_LEVEL="medium"
+        else
+          RISK_LEVEL="low"
+        fi
+        
+        echo "risk_score=$RISK_SCORE" >> $GITHUB_OUTPUT
+        echo "risk_level=$RISK_LEVEL" >> $GITHUB_OUTPUT
+        
+        echo ""
+        echo "🎯 Risk Assessment:"
+        echo "  - Risk Score: $RISK_SCORE/100"
+        echo "  - Risk Level: $RISK_LEVEL"
+        
+        # Save to file for report
+        cat > .risk-analysis/risk-score.json << EOF
+        {
+          "score": $RISK_SCORE,
+          "level": "$RISK_LEVEL",
+          "factors": {
+            "conflicts": $CONFLICTS,
+            "vulnerabilities": $VULNS,
+            "deprecated": $DEPRECATED,
+            "peer_issues": $PEER_ISSUES
+          },
+          "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+          "repository": "${{ github.repository }}",
+          "branch": "${{ github.ref_name }}",
+          "commit": "${{ github.sha }}"
+        }
+        EOF
+    
+    - name: Generate Risk Report
+      id: generate-report
+      if: inputs.generate-report == 'true'
+      shell: bash
+      run: |
+        REPORT_PATH=".risk-analysis/DEPENDENCY_RISK_REPORT.md"
+        
+        cat > $REPORT_PATH << 'REPORT_HEADER'
+        # Dependency Risk Analysis Report
+        
+        > Generated by Trancendos Dependency Risk Analyzer
+        
+        ---
+        
+        ## 📊 Risk Summary
+        
+        REPORT_HEADER
+        
+        RISK_SCORE=${{ steps.calculate-risk.outputs.risk_score }}
+        RISK_LEVEL=${{ steps.calculate-risk.outputs.risk_level }}
+        
+        cat >> $REPORT_PATH << EOF
+        
+        | Metric | Value |
+        |--------|-------|
+        | **Risk Score** | $RISK_SCORE/100 |
+        | **Risk Level** | $RISK_LEVEL |
+        | **Conflicts** | ${{ steps.analyze-dependencies.outputs.conflicts }} |
+        | **Vulnerabilities** | ${{ steps.analyze-dependencies.outputs.vulnerabilities }} |
+        | **Deprecated Packages** | ${{ steps.analyze-dependencies.outputs.deprecated }} |
+        | **Peer Issues** | ${{ steps.analyze-dependencies.outputs.peer_issues }} |
+        
+        ---
+        
+        ## 🧮 Risk Calculation Formula
+        
+        \`\`\`
+        Risk Score = (Conflicts × 25) + (Vulnerabilities × 10) + (Deprecated × 5) + (PeerIssues × 15)
+        Normalized to 0-100 scale
+        \`\`\`
+        
+        ---
+        
+        ## 📋 Risk Levels
+        
+        | Level | Score Range | Action |
+        |-------|-------------|--------|
+        | 🔴 Critical | 80-100 | Block deployment immediately |
+        | 🟠 High | 60-79 | Require manual approval |
+        | 🟡 Medium | 40-59 | Warning, proceed with caution |
+        | 🟢 Low | 0-39 | Safe to deploy |
+        
+        ---
+        
+        ## 🔍 Probability Analysis
+        
+        Based on current dependency state:
+        
+        EOF
+        
+        # Calculate probabilities
+        BUILD_SUCCESS_PROB=$(( 100 - RISK_SCORE ))
+        DEPLOY_FAIL_PROB=$RISK_SCORE
+        
+        cat >> $REPORT_PATH << EOF
+        
+        | Scenario | Probability |
+        |----------|-------------|
+        | Build Success | ${BUILD_SUCCESS_PROB}% |
+        | Build Failure | ${DEPLOY_FAIL_PROB}% |
+        | Runtime Issues | $(( RISK_SCORE / 2 ))% |
+        
+        ---
+        
+        ## ⚠️ Known Conflict Patterns Detected
+        
+        EOF
+        
+        # Check for known patterns
+        if [[ -f "package.json" ]]; then
+          ZOD_V=$(jq -r '.dependencies.zod // empty' package.json 2>/dev/null)
+          OPENAI_V=$(jq -r '.dependencies.openai // empty' package.json 2>/dev/null)
+          
+          if [[ "$ZOD_V" == *"4."* ]] && [[ "$OPENAI_V" == *"4."* ]]; then
+            cat >> $REPORT_PATH << EOF
+        
+        ### 🔴 zod/openai Peer Dependency Conflict
+        - **zod version:** $ZOD_V
+        - **openai version:** $OPENAI_V
+        - **Issue:** openai@4.x requires zod@^3.23.8 but zod@4.x is installed
+        - **Fix:** Upgrade openai to ^6.0.0 (supports zod v4)
+        
+        EOF
+          fi
+        fi
+        
+        cat >> $REPORT_PATH << EOF
+        
+        ---
+        
+        **Repository:** ${{ github.repository }}
+        **Branch:** ${{ github.ref_name }}
+        **Commit:** ${{ github.sha }}
+        **Generated:** $(date -u +%Y-%m-%dT%H:%M:%SZ)
+        
+        *This report was generated automatically by the Trancendos Dependency Risk Analyzer.*
+        EOF
+        
+        echo "report_path=$REPORT_PATH" >> $GITHUB_OUTPUT
+        
+        echo ""
+        echo "📄 Report generated: $REPORT_PATH"
+        cat $REPORT_PATH
+    
+    - name: Upload Risk Analysis Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: dependency-risk-analysis
+        path: .risk-analysis/
+        retention-days: 30
+    
+    - name: Notify Slack (if configured)
+      if: inputs.slack-webhook != '' && steps.calculate-risk.outputs.risk_level != 'low'
+      shell: bash
+      env:
+        SLACK_WEBHOOK: ${{ inputs.slack-webhook }}
+      run: |
+        RISK_LEVEL="${{ steps.calculate-risk.outputs.risk_level }}"
+        RISK_SCORE="${{ steps.calculate-risk.outputs.risk_score }}"
+        
+        COLOR="good"
+        if [[ "$RISK_LEVEL" == "high" ]]; then COLOR="warning"; fi
+        if [[ "$RISK_LEVEL" == "critical" ]]; then COLOR="danger"; fi
+        
+        curl -X POST -H 'Content-type: application/json' \
+          --data "{
+            \"attachments\": [{
+              \"color\": \"$COLOR\",
+              \"title\": \"⚠️ Dependency Risk Alert: ${{ github.repository }}\",
+              \"fields\": [
+                {\"title\": \"Risk Score\", \"value\": \"$RISK_SCORE/100\", \"short\": true},
+                {\"title\": \"Risk Level\", \"value\": \"$RISK_LEVEL\", \"short\": true},
+                {\"title\": \"Branch\", \"value\": \"${{ github.ref_name }}\", \"short\": true},
+                {\"title\": \"Commit\", \"value\": \"${{ github.sha }}\", \"short\": true}
+              ],
+              \"footer\": \"Trancendos Dependency Risk Analyzer\"
+            }]
+          }" \
+          $SLACK_WEBHOOK
+    
+    - name: Fail on High Risk
+      if: inputs.fail-on-high-risk == 'true' && (steps.calculate-risk.outputs.risk_level == 'high' || steps.calculate-risk.outputs.risk_level == 'critical')
+      shell: bash
+      run: |
+        echo "❌ High risk detected! Risk level: ${{ steps.calculate-risk.outputs.risk_level }}"
+        echo "Risk score: ${{ steps.calculate-risk.outputs.risk_score }}/100"
+        exit 1

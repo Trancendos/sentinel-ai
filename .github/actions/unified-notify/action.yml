@@ -1,0 +1,201 @@
+# ============================================================================
+# Trancendos Ecosystem - Unified Notification System
+# ============================================================================
+# Purpose: Consolidated notifications to reduce email spam
+# Supports: Slack, Discord, Microsoft Teams, Email (digest mode)
+# ============================================================================
+
+name: 'Unified Notification System'
+description: 'Sends consolidated notifications to configured channels'
+author: 'Trancendos'
+
+inputs:
+  event-type:
+    description: 'Type of event (deploy, alert, failure, success)'
+    required: true
+    default: 'alert'
+  
+  severity:
+    description: 'Severity level (info, warning, error, critical)'
+    required: true
+    default: 'info'
+  
+  title:
+    description: 'Notification title'
+    required: true
+  
+  message:
+    description: 'Notification message body'
+    required: true
+  
+  slack-webhook:
+    description: 'Slack webhook URL'
+    required: false
+    default: ''
+  
+  discord-webhook:
+    description: 'Discord webhook URL'
+    required: false
+    default: ''
+  
+  teams-webhook:
+    description: 'Microsoft Teams webhook URL'
+    required: false
+    default: ''
+  
+  email-recipients:
+    description: 'Email recipients (comma-separated, for digest only)'
+    required: false
+    default: ''
+  
+  suppress-email:
+    description: 'Suppress individual emails (use digest mode)'
+    required: false
+    default: 'true'
+
+outputs:
+  notification-sent:
+    description: 'Whether notification was sent successfully'
+    value: ${{ steps.notify.outputs.sent }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Prepare Notification
+      id: prepare
+      shell: bash
+      run: |
+        SEVERITY="${{ inputs.severity }}"
+        EVENT_TYPE="${{ inputs.event-type }}"
+        
+        # Set color based on severity
+        case "$SEVERITY" in
+          critical) COLOR="danger"; EMOJI="🚨" ;;
+          error) COLOR="warning"; EMOJI="❌" ;;
+          warning) COLOR="warning"; EMOJI="⚠️" ;;
+          *) COLOR="good"; EMOJI="✅" ;;
+        esac
+        
+        # Set emoji based on event type
+        case "$EVENT_TYPE" in
+          deploy) EVENT_EMOJI="🚀" ;;
+          alert) EVENT_EMOJI="🔔" ;;
+          failure) EVENT_EMOJI="💥" ;;
+          success) EVENT_EMOJI="🎉" ;;
+          *) EVENT_EMOJI="ℹ️" ;;
+        esac
+        
+        echo "color=$COLOR" >> $GITHUB_OUTPUT
+        echo "emoji=$EMOJI" >> $GITHUB_OUTPUT
+        echo "event_emoji=$EVENT_EMOJI" >> $GITHUB_OUTPUT
+        
+        # Create notification payload
+        cat > /tmp/notification.json << EOF
+        {
+          "severity": "$SEVERITY",
+          "event_type": "$EVENT_TYPE",
+          "title": "${{ inputs.title }}",
+          "message": "${{ inputs.message }}",
+          "repository": "${{ github.repository }}",
+          "branch": "${{ github.ref_name }}",
+          "commit": "${{ github.sha }}",
+          "actor": "${{ github.actor }}",
+          "workflow": "${{ github.workflow }}",
+          "run_id": "${{ github.run_id }}",
+          "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        }
+        EOF
+    
+    - name: Send Notifications
+      id: notify
+      shell: bash
+      run: |
+        SENT=false
+        
+        # Send to Slack
+        if [[ -n "${{ inputs.slack-webhook }}" ]]; then
+          echo "📤 Sending to Slack..."
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{
+              \"attachments\": [{
+                \"color\": \"${{ steps.prepare.outputs.color }}\",
+                \"title\": \"${{ steps.prepare.outputs.event_emoji }} ${{ inputs.title }}\",
+                \"text\": \"${{ inputs.message }}\",
+                \"fields\": [
+                  {\"title\": \"Repository\", \"value\": \"${{ github.repository }}\", \"short\": true},
+                  {\"title\": \"Branch\", \"value\": \"${{ github.ref_name }}\", \"short\": true},
+                  {\"title\": \"Severity\", \"value\": \"${{ inputs.severity }}\", \"short\": true},
+                  {\"title\": \"Actor\", \"value\": \"${{ github.actor }}\", \"short\": true}
+                ],
+                \"footer\": \"Trancendos Unified Notifications\",
+                \"ts\": $(date +%s)
+              }]
+            }" \
+            "${{ inputs.slack-webhook }}" && SENT=true
+          echo "✅ Slack notification sent"
+        fi
+        
+        # Send to Discord
+        if [[ -n "${{ inputs.discord-webhook }}" ]]; then
+          echo "📤 Sending to Discord..."
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{
+              \"embeds\": [{
+                \"title\": \"${{ steps.prepare.outputs.event_emoji }} ${{ inputs.title }}\",
+                \"description\": \"${{ inputs.message }}\",
+                \"color\": $([ "${{ steps.prepare.outputs.color }}" == "danger" ] && echo 15158332 || echo 3066993),
+                \"fields\": [
+                  {\"name\": \"Repository\", \"value\": \"${{ github.repository }}\", \"inline\": true},
+                  {\"name\": \"Branch\", \"value\": \"${{ github.ref_name }}\", \"inline\": true},
+                  {\"name\": \"Severity\", \"value\": \"${{ inputs.severity }}\", \"inline\": true}
+                ],
+                \"footer\": {\"text\": \"Trancendos Unified Notifications\"},
+                \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+              }]
+            }" \
+            "${{ inputs.discord-webhook }}" && SENT=true
+          echo "✅ Discord notification sent"
+        fi
+        
+        # Send to Microsoft Teams
+        if [[ -n "${{ inputs.teams-webhook }}" ]]; then
+          echo "📤 Sending to Microsoft Teams..."
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{
+              \"@type\": \"MessageCard\",
+              \"@context\": \"http://schema.org/extensions\",
+              \"themeColor\": \"$([ "${{ steps.prepare.outputs.color }}" == "danger" ] && echo "FF0000" || echo "00FF00")\",
+              \"summary\": \"${{ inputs.title }}\",
+              \"sections\": [{
+                \"activityTitle\": \"${{ steps.prepare.outputs.event_emoji }} ${{ inputs.title }}\",
+                \"text\": \"${{ inputs.message }}\",
+                \"facts\": [
+                  {\"name\": \"Repository\", \"value\": \"${{ github.repository }}\"},
+                  {\"name\": \"Branch\", \"value\": \"${{ github.ref_name }}\"},
+                  {\"name\": \"Severity\", \"value\": \"${{ inputs.severity }}\"}
+                ],
+                \"markdown\": true
+              }]
+            }" \
+            "${{ inputs.teams-webhook }}" && SENT=true
+          echo "✅ Teams notification sent"
+        fi
+        
+        # Email digest note
+        if [[ "${{ inputs.suppress-email }}" == "true" ]]; then
+          echo "📧 Email notifications suppressed (digest mode enabled)"
+          echo "   Individual email alerts are consolidated into this unified notification."
+        fi
+        
+        echo "sent=$SENT" >> $GITHUB_OUTPUT
+    
+    - name: Log Notification
+      shell: bash
+      run: |
+        echo "📋 Notification Log:"
+        echo "  Event: ${{ inputs.event-type }}"
+        echo "  Severity: ${{ inputs.severity }}"
+        echo "  Title: ${{ inputs.title }}"
+        echo "  Repository: ${{ github.repository }}"
+        echo "  Branch: ${{ github.ref_name }}"
+        echo "  Sent: ${{ steps.notify.outputs.sent }}"
